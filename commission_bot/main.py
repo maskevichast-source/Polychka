@@ -15,9 +15,14 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
 from config import ConfigurationError, Settings, load_settings
+from bot_utils import local_today
+from correction_handlers import router as correction_router
 from google_sheets_api import GoogleSheetsAPI
-from handlers import local_today, router
+from handlers import router
 from keyboards import monthly_settings_keyboard
+from payout_handlers import router as payout_router
+from report_handlers import router as reports_router
+from report_handlers import send_monthly_backup
 
 
 logger = logging.getLogger(__name__)
@@ -60,7 +65,8 @@ async def send_monthly_settings_prompt(bot: Bot, app_settings: Settings) -> None
     text = (
         f"Пора задать настройки на {month_key}.\n"
         "Введите месячный план продаж, стандартное количество рабочих дней "
-        "и стоимость 1 МРП для расчёта лимита больничного."
+        "и стоимость 1 МРП. Также потребуется средний дневной заработок, "
+        "согласованный с бухгалтером, для расчёта больничного."
     )
     for user_id in app_settings.allowed_telegram_user_ids:
         try:
@@ -83,7 +89,11 @@ async def register_commands(bot: Bot) -> None:
             BotCommand(command="tuesday_sync", description="Оплаты к отправке на выплату"),
             BotCommand(command="kpi", description="Отметить критерии KPI"),
             BotCommand(command="timesheet", description="Отметить рабочий статус"),
-            BotCommand(command="set_plan", description="Задать план и рабочие дни"),
+            BotCommand(command="set_plan", description="Задать настройки месяца"),
+            BotCommand(command="edit_deal", description="Исправить сделку с журналом"),
+            BotCommand(command="edit_payment", description="Исправить оплату с журналом"),
+            BotCommand(command="report", description="Скачать отчёт за месяц"),
+            BotCommand(command="backup", description="Скачать резервную копию"),
             BotCommand(command="cancel", description="Отменить текущий ввод"),
             BotCommand(command="my_id", description="Показать ваш Telegram ID"),
         ],
@@ -112,6 +122,9 @@ async def run_bot() -> None:
     dispatcher["sheets"] = sheets
     dispatcher["settings"] = app_settings
     dispatcher.include_router(router)
+    dispatcher.include_router(payout_router)
+    dispatcher.include_router(correction_router)
+    dispatcher.include_router(reports_router)
 
     await register_commands(bot)
     scheduler = AsyncIOScheduler(timezone=ZoneInfo(app_settings.timezone))
@@ -125,6 +138,20 @@ async def run_bot() -> None:
         ),
         args=[bot, app_settings],
         id="monthly-settings-prompt",
+        replace_existing=True,
+        coalesce=True,
+        misfire_grace_time=3600,
+    )
+    scheduler.add_job(
+        send_monthly_backup,
+        trigger=CronTrigger(
+            day="last",
+            hour=20,
+            minute=0,
+            timezone=ZoneInfo(app_settings.timezone),
+        ),
+        args=[bot, sheets, app_settings],
+        id="monthly-sheets-backup",
         replace_existing=True,
         coalesce=True,
         misfire_grace_time=3600,

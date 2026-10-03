@@ -6,6 +6,8 @@ from typing import Mapping, Sequence
 
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
+from calculations import month_label_ru
+
 
 def deal_type_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
@@ -50,24 +52,28 @@ def deal_picker_keyboard(deals: Sequence[Mapping[str, str]]) -> InlineKeyboardMa
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def payout_keyboard() -> InlineKeyboardMarkup:
+def payout_keyboard(month_counts: Sequence[tuple[str, int]]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="Отметить все как отправленные",
-                    callback_data="payout:confirm-all",
+                    text=f"{month_label_ru(month)} — {count} оплат",
+                    callback_data=f"payout:preview:{month}",
                 )
             ]
+            for month, count in month_counts
         ]
     )
 
 
-def payout_confirmation_keyboard() -> InlineKeyboardMarkup:
+def payout_confirmation_keyboard(month_key: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
-                InlineKeyboardButton(text="Подтвердить", callback_data="payout:mark-all"),
+                InlineKeyboardButton(
+                    text="Создать пакет выплаты",
+                    callback_data=f"payout:confirm:{month_key}",
+                ),
                 InlineKeyboardButton(text="Отмена", callback_data="payout:cancel"),
             ]
         ]
@@ -77,7 +83,6 @@ def payout_confirmation_keyboard() -> InlineKeyboardMarkup:
 def kpi_keyboard(statuses: Mapping[str, str]) -> InlineKeyboardMarkup:
     labels = (
         ("crm", "CRM", "Criteria 1 (CRM)"),
-        ("plan", "Личный план ≥ 90%", "Criteria 2 (Plan >90%)"),
         ("marketing", "Участие в маркетинге", "Criteria 3 (Marketing)"),
     )
     return InlineKeyboardMarkup(
@@ -89,6 +94,44 @@ def kpi_keyboard(statuses: Mapping[str, str]) -> InlineKeyboardMarkup:
                 )
             ]
             for key, label, column in labels
+        ]
+    )
+
+
+def deal_edit_field_keyboard() -> InlineKeyboardMarkup:
+    labels = (
+        ("amount", "Сумма сделки"),
+        ("designer", "Процент дизайнера"),
+        ("discount", "Скидка клиенту"),
+        ("item_type", "Тип товара"),
+        ("covered", "Скидка за счёт бонуса"),
+    )
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=label,
+                    callback_data=f"deal-edit:{key}",
+                )
+            ]
+            for key, label in labels
+        ]
+    )
+
+
+def item_type_edit_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="Со склада", callback_data="deal-edit-type:stock"),
+                InlineKeyboardButton(text="Под заказ", callback_data="deal-edit-type:order"),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="Распродажа",
+                    callback_data="deal-edit-type:sale",
+                )
+            ],
         ]
     )
 

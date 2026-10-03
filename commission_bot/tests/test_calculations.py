@@ -88,8 +88,9 @@ class PayrollTests(unittest.TestCase):
         )
 
     def test_sick_pay_uses_daily_average_and_monthly_cap(self) -> None:
-        self.assertEqual(calculate_sick_pay("3", "20", "5000"), Decimal("37500.00"))
-        self.assertEqual(calculate_sick_pay("30", "20", "1000"), Decimal("25000.00"))
+        self.assertEqual(calculate_sick_pay("3", "12500", "5000"), Decimal("37500.00"))
+        self.assertEqual(calculate_sick_pay("30", "1000", "1000"), Decimal("25000.00"))
+        self.assertEqual(calculate_sick_pay("0", "", "5000"), Decimal("0"))
 
     def test_kpi_maximum_is_one_hundred_thousand(self) -> None:
         self.assertEqual(
@@ -98,13 +99,69 @@ class PayrollTests(unittest.TestCase):
                     "Criteria 1 (CRM)": "Yes",
                     "Criteria 2 (Plan >90%)": "Yes",
                     "Criteria 3 (Marketing)": "Yes",
-                }
+                },
+                Decimal("100"),
             ),
             Decimal("100000"),
         )
 
+    def test_plan_kpi_is_derived_from_sales_not_the_stored_toggle(self) -> None:
+        self.assertEqual(
+            calculate_kpi_bonus(
+                {
+                    "Criteria 1 (CRM)": "Yes",
+                    "Criteria 2 (Plan >90%)": "Yes",
+                    "Criteria 3 (Marketing)": "No",
+                },
+                Decimal("89.99"),
+            ),
+            Decimal("30000"),
+        )
+        self.assertEqual(
+            calculate_kpi_bonus(
+                {
+                    "Criteria 1 (CRM)": "No",
+                    "Criteria 2 (Plan >90%)": "No",
+                    "Criteria 3 (Marketing)": "No",
+                },
+                Decimal("90"),
+            ),
+            Decimal("40000"),
+        )
+
 
 class DashboardTests(unittest.TestCase):
+    def test_legacy_settings_need_average_daily_pay_only_if_sick_days_exist(self) -> None:
+        settings = [
+            {
+                "Month": "10",
+                "Year": "2026",
+                "Standard working days": "20",
+                "Monthly Sales Plan": "1000",
+                "1 MRP value (in KZT)": "5000",
+                "Average daily pay (in KZT)": "",
+            }
+        ]
+        totals = calculate_dashboard_totals(
+            "2026-10",
+            settings,
+            [],
+            [],
+            [],
+            [],
+        )
+        self.assertEqual(totals.sick_pay, Decimal("0.00"))
+
+        with self.assertRaises(CalculationError):
+            calculate_dashboard_totals(
+                "2026-10",
+                settings,
+                [],
+                [],
+                [{"Date": "2026-10-01", "Status": "Sick"}],
+                [],
+            )
+
     def test_month_summary_counts_plan_payments_attendance_and_kpi(self) -> None:
         totals = calculate_dashboard_totals(
             "2026-10",
@@ -115,6 +172,7 @@ class DashboardTests(unittest.TestCase):
                     "Standard working days": "20",
                     "Monthly Sales Plan": "1000",
                     "1 MRP value (in KZT)": "5000",
+                    "Average daily pay (in KZT)": "12500",
                 }
             ],
             deal_records=[
@@ -167,6 +225,8 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual(totals.expected_bonus, Decimal("12.90"))
         self.assertEqual(totals.submitted_bonus, Decimal("12.90"))
         self.assertEqual(totals.kpi_bonus, Decimal("70000"))
+        self.assertEqual(totals.pending_bonus, Decimal("0.00"))
+        self.assertEqual(totals.payment_bonus_by_id["P-1"], Decimal("12.90"))
         self.assertEqual(
             totals.total_expected_income,
             totals.fixed_salary + totals.sick_pay + totals.expected_bonus + totals.kpi_bonus,
@@ -182,6 +242,7 @@ class DashboardTests(unittest.TestCase):
                     "Standard working days": "20",
                     "Monthly Sales Plan": "1000",
                     "1 MRP value (in KZT)": "5000",
+                    "Average daily pay (in KZT)": "12500",
                 }
             ],
             deal_records=[
@@ -224,6 +285,7 @@ class DashboardTests(unittest.TestCase):
             kpi_records=[],
         )
         self.assertEqual(totals.expected_bonus, Decimal("4.55"))
+        self.assertEqual(totals.pending_bonus, Decimal("4.55"))
 
 
 if __name__ == "__main__":

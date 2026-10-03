@@ -48,16 +48,20 @@ Run a single Railway instance to avoid duplicate polling and scheduled prompts.
 ## Google Sheets
 
 On first successful connection, the bot creates the following worksheets and
-header rows when needed: `Settings`, `Deals`, `Payments`, `Timesheet`, and
-`KPI`. Existing worksheets are retained; missing headers are appended. The
-`Deals` worksheet includes an additional `Discount Covered by Designer?`
-column because that affects the discount coefficient.
+header rows when needed: `Settings`, `Deals`, `Payments`, `Timesheet`, `KPI`,
+`Payout Batches`, and `Audit Log`. Existing worksheets are retained; missing
+headers are appended. The `Deals` worksheet includes an additional `Discount
+Covered by Designer?` column because that affects the discount coefficient.
+Payments record the payout batch, submission time, Telegram user ID, and bonus
+amount snapshot once a batch is confirmed.
 
 The `Settings` worksheet stores one row per month. On the second day of each
-month at 09:00 Asia/Almaty time, the bot asks authorized users to enter the
-monthly sales plan, standard working days and current 1 MRP value. Use
-`/set_plan` to enter the current month manually, or `/set_plan YYYY-MM` for a
-specific month.
+month at 09:00 in the configured timezone, the bot asks authorized users to
+enter the monthly sales plan, standard working days, current 1 MRP value, and
+the average daily pay used for sick pay. Enter the average daily pay supplied
+or approved by the company's accountant; the bot does not infer a statutory
+average-wage formula. Use `/set_plan` to enter the current month manually, or
+`/set_plan YYYY-MM` for a specific month.
 
 ## Commands
 
@@ -65,12 +69,27 @@ specific month.
   KPI and expected income
 - `/add_deal` — record a deal and its designer/discount details
 - `/add_payment` — record a client's actual payment against a deal
-- `/tuesday_sync` — list payments not yet submitted for payout and mark them
-- `/kpi` — toggle the three current-month KPI criteria
+- `/tuesday_sync` — review pending payments by month and create a confirmed
+  payout batch
+- `/kpi` — toggle CRM and marketing criteria; the 90% plan criterion is
+  calculated automatically from actual monthly sales
 - `/timesheet` — mark today's status; pass `YYYY-MM-DD` to enter another date
-- `/set_plan` — set a month's plan, standard working days and 1 MRP value
+- `/set_plan` — set a month's plan, workdays, 1 MRP value, and accountant-approved
+  average daily pay
+- `/edit_deal` — edit a deal field with a required reason and audit entry
+- `/edit_payment` — edit an unpaid payment with a required reason and audit
+  entry; payments already in a payout batch are locked
+- `/report [YYYY-MM]` — download a CSV month report (defaults to current month)
+- `/backup` — download a JSON export of every bot worksheet
 - `/cancel` — stop the current form
 - `/my_id` — show the caller's Telegram ID
+
+Payout batches only include pending payments from the selected payment month.
+The bot shows payment IDs, amounts, calculated bonuses, and the batch total
+before confirmation. Confirmation writes the batch and its audit entry in the
+same Google Sheets update request. A full JSON backup is also sent to every
+authorized user on the last day of each month at 20:00 in the configured
+timezone.
 
 ## Calculation conventions
 
@@ -89,14 +108,18 @@ specific month.
   uses 0.9, and above 15% uses 0.8. If the designer covers the discount, the
   coefficient is 1.0.
 - Fixed salary is 250,000 KZT multiplied by work-status days divided by standard
-  working days. Sick pay uses the same fixed-salary daily rate and is capped at
-  25 times that month's MRP value. Sick pay is shown separately from prorated
-  fixed salary.
+  working days. Sick pay is the monthly accountant-approved average daily pay
+  multiplied by sick days, capped at 25 times that month's MRP value. The bot
+  does not claim to determine the legally required average-wage calculation.
 - Bonuses in a dashboard month are based on payments dated in that month.
   Each payment uses the plan bands for its linked deal's month; retain a
   `Settings` row for each month that contains deals.
 - KPI values are 30,000 KZT for CRM, 40,000 KZT for reaching 90% of plan, and
-  30,000 KZT for marketing participation.
+  30,000 KZT for marketing participation. The plan criterion is derived from
+  actual sales and cannot be switched on manually.
+- Deal and payment corrections store the previous value, new value, actor,
+  timestamp, and reason in `Audit Log`. Deals linked to submitted payouts and
+  payments already included in a payout batch cannot be edited.
 
 ## Tests
 

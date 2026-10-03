@@ -2,13 +2,10 @@
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import secrets
 from datetime import date, datetime
 from decimal import Decimal
-from typing import Any, Callable
-from zoneinfo import ZoneInfo
 
 from aiogram import F, Router
 from aiogram.fsm.context import FSMContext
@@ -30,10 +27,14 @@ from keyboards import (
     deal_type_keyboard,
     kpi_keyboard,
     monthly_settings_keyboard,
-    payout_confirmation_keyboard,
-    payout_keyboard,
     timesheet_keyboard,
     yes_no_keyboard,
+)
+from bot_utils import (
+    format_amount as _format_amount,
+    local_today,
+    parse_month as _parse_month,
+    run_sheet,
 )
 from states import DealForm, PaymentForm, SettingsForm, TimesheetForm
 
@@ -55,33 +56,6 @@ TIMESHEET_STATUSES = {
     "dayoff": ("Day Off", "Выходной"),
     "sick": ("Sick", "Больничный"),
 }
-
-
-async def run_sheet(function: Callable[..., Any], *args: Any) -> Any:
-    """Keep blocking Google Sheets calls off aiogram's event loop."""
-    try:
-        return await asyncio.to_thread(function, *args)
-    except Exception:
-        logger.exception("Google Sheets operation failed")
-        raise
-
-
-def local_today(settings: Settings) -> date:
-    return datetime.now(ZoneInfo(settings.timezone)).date()
-
-
-def _parse_month(value: str) -> str | None:
-    try:
-        return datetime.strptime(value.strip(), "%Y-%m").strftime("%Y-%m")
-    except ValueError:
-        return None
-
-
-def _format_amount(value: Any) -> str:
-    try:
-        return format_kzt(value)
-    except CalculationError:
-        return f"{value} ₸"
 
 
 async def _start_settings_form(
@@ -115,6 +89,10 @@ async def start_command(message: Message) -> None:
         "/tuesday_sync — список оплат к отправке на выплату\n"
         "/kpi — отметить критерии KPI\n"
         "/timesheet — отметить сегодняшний рабочий статус\n"
+        "/edit_deal — исправить данные сделки с записью в журнал\n"
+        "/edit_payment — исправить ожидающую выплату с записью в журнал\n"
+        "/report — скачать отчёт за месяц\n"
+        "/backup — скачать резервную копию таблиц\n"
         "/set_plan — задать план и рабочие дни\n"
         "/cancel — отменить текущий ввод"
     )
@@ -179,7 +157,6 @@ async def enter_standard_working_days(message: Message, state: FSMContext) -> No
 async def enter_mrp_value(
     message: Message,
     state: FSMContext,
-    sheets: GoogleSheetsAPI,
 ) -> None:
     try:
         mrp = to_decimal(message.text, "MRP value")
@@ -187,6 +164,28 @@ async def enter_mrp_value(
             raise CalculationError("MRP value must be positive")
     except CalculationError:
         await message.answer("Введите положительную стоимость 1 МРП в тенге.")
+        return
+
+    await state.update_data(mrp_value=str(mrp))
+    await state.set_state(SettingsForm.average_daily_pay)
+    await message.answer(
+        "Введите средний дневной заработок в тенге, согласованный с бухгалтером. "
+        "Эта сумма используется для расчёта оплаты больничного."
+    )
+
+
+@router.message(SettingsForm.average_daily_pay)
+async def enter_average_daily_pay(
+    message: Message,
+    state: FSMContext,
+    sheets: GoogleSheetsAPI,
+) -> None:
+    try:
+        average_daily_pay = to_decimal(message.text, "average daily pay")
+        if average_daily_pay <= Decimal("0"):
+            raise CalculationError("average daily pay must be positive")
+    except CalculationError:
+        await message.answer("Введите положительный средний дневной заработок в тенге.")
         return
 
     data = await state.get_data()
@@ -197,7 +196,8 @@ async def enter_mrp_value(
             target_month,
             str(data["monthly_plan"]),
             int(data["standard_working_days"]),
-            str(mrp),
+            str(data["mrp_value"]),
+            str(average_daily_pay),
         )
     except Exception:
         await state.clear()
@@ -212,7 +212,8 @@ async def enter_mrp_value(
         f"Настройки на {month_label_ru(target_month)} сохранены.\n"
         f"План: {_format_amount(data['monthly_plan'])}\n"
         f"Стандартные рабочие дни: {data['standard_working_days']}\n"
-        f"1 МРП: {_format_amount(mrp)}"
+        f"1 МРП: {_format_amount(data['mrp_value'])}\n"
+        f"Средний дневной заработок: {_format_amount(average_daily_pay)}"
     )
 
 
@@ -314,6 +315,7 @@ async def choose_discount_coverage(
             str(data["discount_percent"]),
             str(data["item_type"]),
             covered,
+            callback.from_user.id if callback.from_user else 0,
         )
     except Exception:
         await state.clear()
@@ -393,6 +395,7 @@ async def enter_payment_amount(
             str(data["deal_id"]),
             str(amount),
             local_today(settings),
+            message.from_user.id if message.from_user else 0,
         )
     except Exception:
         await state.clear()
@@ -408,87 +411,24 @@ async def enter_payment_amount(
     )
 
 
-@router.message(Command("tuesday_sync"))
-async def tuesday_sync_command(message: Message, sheets: GoogleSheetsAPI) -> None:
-    try:
-        payments = await run_sheet(sheets.get_unsubmitted_payments)
-        deals = await run_sheet(sheets.get_deals)
-    except Exception:
-        await message.answer("Не удалось получить список оплат из таблицы Google.")
-        return
-    if not payments:
-        await message.answer("Нет новых оплат, ожидающих отправки на выплату.")
-        return
-
-    deal_map = {str(row.get("Deal ID", "")): row for row in deals}
-    lines = ["Оплаты, ещё не отправленные на выплату:"]
-    for payment in payments[:20]:
-        deal_id = str(payment.get("Deal ID", ""))
-        lines.append(
-            f"• {payment.get('Payment ID', '—')} — сделка {deal_id}, "
-            f"{payment.get('Date', '—')}, "
-            f"{_format_amount(payment.get('Actual Paid Amount', '0'))}"
-        )
-        if deal_id not in deal_map:
-            logger.warning("Payment references an unknown deal: %s", deal_id)
-    if len(payments) > 20:
-        lines.append(f"Показаны первые 20 из {len(payments)} оплат.")
-    lines.append(f"Всего ожидают отправки: {len(payments)}.")
-    await message.answer("\n".join(lines), reply_markup=payout_keyboard())
-
-
-@router.callback_query(F.data == "payout:confirm-all")
-async def confirm_all_payouts(callback: CallbackQuery, sheets: GoogleSheetsAPI) -> None:
-    try:
-        payments = await run_sheet(sheets.get_unsubmitted_payments)
-    except Exception:
-        await callback.answer("Не удалось проверить оплаты.", show_alert=True)
-        return
-    if not payments:
-        await callback.answer("Новых оплат нет.", show_alert=True)
-        if callback.message:
-            await callback.message.edit_reply_markup(reply_markup=None)
-        return
-    await callback.answer()
-    if callback.message:
-        await callback.message.answer(
-            f"Отметить все {len(payments)} оплат как отправленные на выплату?",
-            reply_markup=payout_confirmation_keyboard(),
-        )
-
-
-@router.callback_query(F.data == "payout:mark-all")
-async def mark_all_payouts(callback: CallbackQuery, sheets: GoogleSheetsAPI) -> None:
-    try:
-        count = await run_sheet(sheets.mark_all_payments_submitted)
-    except Exception:
-        await callback.answer("Не удалось обновить таблицу.", show_alert=True)
-        return
-    await callback.answer("Статус обновлён.")
-    if callback.message:
-        await callback.message.edit_text(
-            f"Готово. Отмечено отправленными оплат: {count}.",
-            reply_markup=None,
-        )
-
-
-@router.callback_query(F.data == "payout:cancel")
-async def cancel_payout_submission(callback: CallbackQuery) -> None:
-    await callback.answer("Отправка не отмечена.")
-    if callback.message:
-        await callback.message.edit_reply_markup(reply_markup=None)
-
-
-def _kpi_text(month_key: str, statuses: dict[str, str]) -> str:
+def _kpi_text(
+    month_key: str,
+    statuses: dict[str, str],
+    plan_completion_percent: Decimal,
+) -> str:
     checks = (
         ("CRM", "Criteria 1 (CRM)"),
-        ("Личный план не менее 90%", "Criteria 2 (Plan >90%)"),
         ("Участие в маркетинге", "Criteria 3 (Marketing)"),
     )
     lines = [f"KPI за {month_label_ru(month_key)}:"]
     for label, key in checks:
         is_on = statuses.get(key, "No").strip().lower() in {"yes", "да", "true", "1"}
         lines.append(f"{label}: {'выполнено' if is_on else 'не выполнено'}")
+    lines.append(
+        "Личный план не менее 90%: "
+        f"{'выполнено' if plan_completion_percent >= Decimal('90') else 'не выполнено'} "
+        f"({plan_completion_percent}%)"
+    )
     return "\n".join(lines)
 
 
@@ -497,10 +437,25 @@ async def kpi_command(message: Message, sheets: GoogleSheetsAPI, settings: Setti
     month_key = local_today(settings).strftime("%Y-%m")
     try:
         statuses = await run_sheet(sheets.get_kpi, month_key)
+        data = await run_sheet(sheets.get_dashboard_data)
+        totals = calculate_dashboard_totals(
+            month_key,
+            data["settings"],
+            data["deals"],
+            data["payments"],
+            data["timesheet"],
+            data["kpi"],
+        )
     except Exception:
-        await message.answer("Не удалось получить KPI из таблицы Google.")
+        await message.answer(
+            "Не удалось рассчитать KPI. Проверьте настройки месяца командой /set_plan "
+            "и данные в таблице Google."
+        )
         return
-    await message.answer(_kpi_text(month_key, statuses), reply_markup=kpi_keyboard(statuses))
+    await message.answer(
+        _kpi_text(month_key, statuses, totals.plan_completion_percent),
+        reply_markup=kpi_keyboard(statuses),
+    )
 
 
 @router.callback_query(F.data.startswith("kpi:"))
@@ -510,8 +465,20 @@ async def toggle_kpi(
     settings: Settings,
 ) -> None:
     criterion = (callback.data or "").split(":", 1)[1]
+    if criterion not in {"crm", "marketing"}:
+        await callback.answer("Этот критерий рассчитывается автоматически.", show_alert=True)
+        return
     month_key = local_today(settings).strftime("%Y-%m")
     try:
+        data = await run_sheet(sheets.get_dashboard_data)
+        totals = calculate_dashboard_totals(
+            month_key,
+            data["settings"],
+            data["deals"],
+            data["payments"],
+            data["timesheet"],
+            data["kpi"],
+        )
         statuses = await run_sheet(sheets.toggle_kpi, month_key, criterion)
     except Exception:
         await callback.answer("Не удалось обновить KPI.", show_alert=True)
@@ -519,7 +486,7 @@ async def toggle_kpi(
     await callback.answer("Статус обновлён.")
     if callback.message:
         await callback.message.edit_text(
-            _kpi_text(month_key, statuses),
+            _kpi_text(month_key, statuses, totals.plan_completion_percent),
             reply_markup=kpi_keyboard(statuses),
         )
 
@@ -600,10 +567,19 @@ async def dashboard_command(
         })
     except Exception as error:
         logger.exception("Dashboard calculation failed")
-        if isinstance(error, CalculationError) and "settings" in str(error).lower():
+        if (
+            isinstance(error, CalculationError)
+            and "average_daily_pay" in str(error).lower()
+        ):
+            await message.answer(
+                "Для расчёта больничного задайте средний дневной заработок, "
+                "согласованный с бухгалтером, командой /set_plan."
+            )
+        elif isinstance(error, CalculationError) and "settings" in str(error).lower():
             await message.answer(
                 "Не хватает настроек месяца для расчёта. Задайте план, стандартные "
-                "рабочие дни и стоимость 1 МРП командой /set_plan."
+                "рабочие дни, стоимость 1 МРП и средний дневной заработок командой "
+                "/set_plan."
             )
         elif isinstance(error, CalculationError):
             await message.answer(
@@ -627,6 +603,7 @@ async def dashboard_command(
         f"Продажи: {format_kzt(totals.plan_sales)} / {format_kzt(totals.monthly_plan)}\n\n"
         f"Бонусы — ожидается: {format_kzt(totals.expected_bonus)}\n"
         f"Бонусы — отправлено на выплату: {format_kzt(totals.submitted_bonus)}\n"
+        f"Ожидают пакета выплаты: {format_kzt(totals.pending_bonus)}\n"
         f"Начислено по KPI: {format_kzt(totals.kpi_bonus)}\n\n"
         f"Ожидаемый доход за месяц: {format_kzt(totals.total_expected_income)}"
     )

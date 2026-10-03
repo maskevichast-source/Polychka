@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import json
 import os
-from datetime import date
+from datetime import date, datetime, timezone
+from decimal import Decimal
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
+
+from calculations import normalize_month
 
 
 SCOPES = (
@@ -24,6 +27,7 @@ SHEET_HEADERS: dict[str, tuple[str, ...]] = {
         "Standard working days",
         "Monthly Sales Plan",
         "1 MRP value (in KZT)",
+        "Average daily pay (in KZT)",
     ),
     "Deals": (
         "Deal ID",
@@ -40,6 +44,10 @@ SHEET_HEADERS: dict[str, tuple[str, ...]] = {
         "Actual Paid Amount",
         "Date",
         "Submitted for Payout",
+        "Payout Batch ID",
+        "Payout Submitted At",
+        "Payout Submitted By",
+        "Payout Bonus Amount",
     ),
     "Timesheet": (
         "Date",
@@ -51,12 +59,45 @@ SHEET_HEADERS: dict[str, tuple[str, ...]] = {
         "Criteria 2 (Plan >90%)",
         "Criteria 3 (Marketing)",
     ),
+    "Payout Batches": (
+        "Batch ID",
+        "Month",
+        "Created At",
+        "Actor Telegram ID",
+        "Payment Count",
+        "Bonus Total",
+        "Payment IDs",
+    ),
+    "Audit Log": (
+        "Timestamp",
+        "Actor Telegram ID",
+        "Action",
+        "Entity Type",
+        "Entity ID",
+        "Field",
+        "Old Value",
+        "New Value",
+        "Reason",
+    ),
 }
 
 KPI_COLUMNS = {
     "crm": "Criteria 1 (CRM)",
-    "plan": "Criteria 2 (Plan >90%)",
     "marketing": "Criteria 3 (Marketing)",
+}
+
+NUMERIC_COLUMNS = {
+    "Standard working days",
+    "Monthly Sales Plan",
+    "1 MRP value (in KZT)",
+    "Average daily pay (in KZT)",
+    "Deal Total Amount",
+    "Designer %",
+    "Client Discount %",
+    "Actual Paid Amount",
+    "Payment Count",
+    "Bonus Total",
+    "Payout Bonus Amount",
 }
 
 
@@ -165,11 +206,91 @@ class GoogleSheetsAPI:
             result.append(dict(zip(headers, padded)))
         return result
 
-    def _append_record(self, title: str, values: Mapping[str, Any]) -> None:
+    @staticmethod
+    def _cell_value(value: Any, numeric: bool = False) -> dict[str, Any]:
+        if value is None or value == "":
+            return {"userEnteredValue": {"stringValue": ""}}
+        if numeric:
+            try:
+                return {"userEnteredValue": {"numberValue": float(value)}}
+            except (TypeError, ValueError):
+                pass
+        return {"userEnteredValue": {"stringValue": str(value)}}
+
+    def _append_cells_request(
+        self,
+        title: str,
+        values: Mapping[str, Any],
+    ) -> dict[str, Any]:
         worksheet = self._worksheet(title)
         headers = worksheet.row_values(1)
-        row = [values.get(header, "") for header in headers]
-        worksheet.append_row(row, value_input_option="USER_ENTERED")
+        return {
+            "appendCells": {
+                "sheetId": worksheet.id,
+                "rows": [
+                    {
+                        "values": [
+                            self._cell_value(
+                                values.get(header, ""),
+                                numeric=header in NUMERIC_COLUMNS,
+                            )
+                            for header in headers
+                        ]
+                    }
+                ],
+                "fields": "userEnteredValue",
+            }
+        }
+
+    @staticmethod
+    def _update_cell_request(
+        sheet_id: int,
+        row_index: int,
+        column_index: int,
+        value: Any,
+        numeric: bool = False,
+    ) -> dict[str, Any]:
+        return {
+            "updateCells": {
+                "range": {
+                    "sheetId": sheet_id,
+                    "startRowIndex": row_index,
+                    "endRowIndex": row_index + 1,
+                    "startColumnIndex": column_index,
+                    "endColumnIndex": column_index + 1,
+                },
+                "rows": [{"values": [GoogleSheetsAPI._cell_value(value, numeric)]}],
+                "fields": "userEnteredValue",
+            }
+        }
+
+    def _audit_values(
+        self,
+        actor_id: int | str,
+        action: str,
+        entity_type: str,
+        entity_id: str,
+        field: str,
+        old_value: Any,
+        new_value: Any,
+        reason: str = "",
+    ) -> dict[str, Any]:
+        def render(value: Any) -> str:
+            if isinstance(value, (dict, list)):
+                return json.dumps(value, ensure_ascii=False, default=str, sort_keys=True)
+            return str(value)
+
+        return {
+            "Timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "Actor Telegram ID": str(actor_id),
+            "Action": action,
+            "Entity Type": entity_type,
+            "Entity ID": entity_id,
+            "Field": field,
+            "Old Value": render(old_value),
+            "New Value": render(new_value),
+            "Reason": reason,
+        }
 
     def _upsert_record(
         self,
@@ -215,6 +336,7 @@ class GoogleSheetsAPI:
         monthly_plan: str,
         standard_working_days: int,
         mrp_value: str,
+        average_daily_pay: str,
     ) -> None:
         year, month = self._split_month(month_key)
         self._upsert_record(
@@ -225,6 +347,7 @@ class GoogleSheetsAPI:
                 "Standard working days": standard_working_days,
                 "Monthly Sales Plan": monthly_plan,
                 "1 MRP value (in KZT)": mrp_value,
+                "Average daily pay (in KZT)": average_daily_pay,
             },
             ("Year", "Month"),
         )
@@ -238,20 +361,31 @@ class GoogleSheetsAPI:
         discount_percent: str,
         item_type: str,
         discount_covered_by_designer: bool,
+        actor_id: int,
     ) -> None:
-        self._append_record(
-            "Deals",
+        values = {
+            "Deal ID": deal_id,
+            "Date": deal_date.isoformat(),
+            "Deal Total Amount": amount,
+            "Designer %": designer_percent,
+            "Client Discount %": discount_percent,
+            "Item Type": item_type,
+            "Discount Covered by Designer?": (
+                "Yes" if discount_covered_by_designer else "No"
+            ),
+        }
+        self._require_workbook().batch_update(
             {
-                "Deal ID": deal_id,
-                "Date": deal_date.isoformat(),
-                "Deal Total Amount": amount,
-                "Designer %": designer_percent,
-                "Client Discount %": discount_percent,
-                "Item Type": item_type,
-                "Discount Covered by Designer?": (
-                    "Yes" if discount_covered_by_designer else "No"
-                ),
-            },
+                "requests": [
+                    self._append_cells_request("Deals", values),
+                    self._append_cells_request(
+                        "Audit Log",
+                        self._audit_values(
+                            actor_id, "CREATE", "Deal", deal_id, "", "", values
+                        ),
+                    ),
+                ]
+            }
         )
 
     def add_payment(
@@ -260,16 +394,27 @@ class GoogleSheetsAPI:
         deal_id: str,
         paid_amount: str,
         payment_date: date,
+        actor_id: int,
     ) -> None:
-        self._append_record(
-            "Payments",
+        values = {
+            "Payment ID": payment_id,
+            "Deal ID": deal_id,
+            "Actual Paid Amount": paid_amount,
+            "Date": payment_date.isoformat(),
+            "Submitted for Payout": "No",
+        }
+        self._require_workbook().batch_update(
             {
-                "Payment ID": payment_id,
-                "Deal ID": deal_id,
-                "Actual Paid Amount": paid_amount,
-                "Date": payment_date.isoformat(),
-                "Submitted for Payout": "No",
-            },
+                "requests": [
+                    self._append_cells_request("Payments", values),
+                    self._append_cells_request(
+                        "Audit Log",
+                        self._audit_values(
+                            actor_id, "CREATE", "Payment", payment_id, "", "", values
+                        ),
+                    ),
+                ]
+            }
         )
 
     def get_deals(self) -> list[dict[str, str]]:
@@ -277,6 +422,26 @@ class GoogleSheetsAPI:
 
     def get_payments(self) -> list[dict[str, str]]:
         return self._records("Payments")
+
+    def get_deal_by_id(self, deal_id: str) -> dict[str, str] | None:
+        return next(
+            (
+                row
+                for row in self.get_deals()
+                if str(row.get("Deal ID", "")).strip() == deal_id.strip()
+            ),
+            None,
+        )
+
+    def get_pending_payment_by_id(self, payment_id: str) -> dict[str, str] | None:
+        return next(
+            (
+                row
+                for row in self.get_unsubmitted_payments()
+                if str(row.get("Payment ID", "")).strip() == payment_id.strip()
+            ),
+            None,
+        )
 
     def get_unsubmitted_payments(self) -> list[dict[str, str]]:
         return [
@@ -286,23 +451,220 @@ class GoogleSheetsAPI:
             not in {"yes", "да", "true", "1"}
         ]
 
-    def mark_all_payments_submitted(self) -> int:
+    def mark_payout_batch(
+        self,
+        month_key: str,
+        batch_id: str,
+        created_at: str,
+        actor_id: int,
+        payment_bonus_by_id: Mapping[str, Any],
+    ) -> int:
+        """Atomically mark a month of pending payments and append batch/audit rows."""
         worksheet = self._worksheet("Payments")
         values = worksheet.get_all_values()
         if not values:
             return 0
         headers = values[0]
-        status_column = headers.index("Submitted for Payout") + 1
-        changed_rows = 0
+        header_index = {header: index for index, header in enumerate(headers)}
+        id_column = header_index["Payment ID"]
+        date_column = header_index["Date"]
+        status_column = header_index["Submitted for Payout"]
+        target_ids = set(payment_bonus_by_id)
+        matched_ids: set[str] = set()
+        updates: list[dict[str, Any]] = []
+        cells_to_set = {
+            "Submitted for Payout": "Yes",
+            "Payout Batch ID": batch_id,
+            "Payout Submitted At": created_at,
+            "Payout Submitted By": str(actor_id),
+            "Payout Bonus Amount": "",
+        }
+
         for row_number, row in enumerate(values[1:], start=2):
-            current_status = row[status_column - 1] if len(row) >= status_column else ""
+            padded = row + [""] * max(0, len(headers) - len(row))
+            current_status = padded[status_column]
             if str(current_status).strip().lower() in {"yes", "да", "true", "1"}:
                 continue
             if not any(str(value).strip() for value in row):
                 continue
-            worksheet.update_cell(row_number, status_column, "Yes")
-            changed_rows += 1
-        return changed_rows
+            payment_id = str(padded[id_column]).strip()
+            payment_month = normalize_month(padded[date_column])
+            if payment_id not in target_ids or payment_month != month_key:
+                continue
+            matched_ids.add(payment_id)
+            cells_to_set["Payout Bonus Amount"] = str(payment_bonus_by_id[payment_id])
+            for field, value in cells_to_set.items():
+                updates.append(
+                    self._update_cell_request(
+                        worksheet.id,
+                        row_number - 1,
+                        header_index[field],
+                        value,
+                        numeric=field == "Payout Bonus Amount",
+                    )
+                )
+
+        if matched_ids != target_ids:
+            missing = ", ".join(sorted(target_ids - matched_ids))
+            raise ValueError(
+                "Pending payments changed before payout confirmation"
+                + (f": {missing}" if missing else "")
+            )
+        if not matched_ids:
+            return 0
+
+        bonus_total = sum(
+            (Decimal(str(payment_bonus_by_id[payment_id])) for payment_id in matched_ids),
+            Decimal("0"),
+        )
+        batch_values = {
+            "Batch ID": batch_id,
+            "Month": month_key,
+            "Created At": created_at,
+            "Actor Telegram ID": str(actor_id),
+            "Payment Count": len(matched_ids),
+            "Bonus Total": bonus_total,
+            "Payment IDs": json.dumps(sorted(matched_ids), ensure_ascii=False),
+        }
+        audit_values = self._audit_values(
+            actor_id,
+            "PAYOUT_BATCH_SUBMITTED",
+            "Payout Batch",
+            batch_id,
+            "Payment IDs",
+            "",
+            json.dumps(sorted(matched_ids), ensure_ascii=False),
+            f"Месяц {month_key}; бонусы к выплате: {bonus_total:.2f} KZT",
+        )
+        updates.extend(
+            [
+                self._append_cells_request("Payout Batches", batch_values),
+                self._append_cells_request("Audit Log", audit_values),
+            ]
+        )
+        self._require_workbook().batch_update({"requests": updates})
+        return len(matched_ids)
+
+    def update_deal_field(
+        self,
+        deal_id: str,
+        field: str,
+        new_value: str,
+        actor_id: int,
+        reason: str,
+    ) -> tuple[str, str]:
+        allowed_fields = {
+            "Deal Total Amount",
+            "Designer %",
+            "Client Discount %",
+            "Item Type",
+            "Discount Covered by Designer?",
+        }
+        if field not in allowed_fields:
+            raise ValueError("This deal field cannot be edited")
+        worksheet = self._worksheet("Deals")
+        values = worksheet.get_all_values()
+        headers = values[0] if values else []
+        if field not in headers or "Deal ID" not in headers:
+            raise RuntimeError("Deals worksheet is missing required headers")
+        id_column = headers.index("Deal ID")
+        field_column = headers.index(field)
+        target = None
+        for row_number, row in enumerate(values[1:], start=2):
+            padded = row + [""] * max(0, len(headers) - len(row))
+            if str(padded[id_column]).strip() == deal_id.strip():
+                target = (row_number, padded)
+                break
+        if target is None:
+            raise KeyError(f"Deal {deal_id} was not found")
+        row_number, row = target
+
+        for payment in self.get_payments():
+            if (
+                str(payment.get("Deal ID", "")).strip() == deal_id.strip()
+                and str(payment.get("Submitted for Payout", "")).strip().lower()
+                in {"yes", "да", "true", "1"}
+            ):
+                raise ValueError(
+                    "Deal has a submitted payout and cannot be edited"
+                )
+
+        old_value = str(row[field_column])
+        if old_value == new_value:
+            raise ValueError("The new value is unchanged")
+        audit_values = self._audit_values(
+            actor_id, "CORRECT", "Deal", deal_id, field, old_value, new_value, reason
+        )
+        self._require_workbook().batch_update(
+            {
+                "requests": [
+                    self._update_cell_request(
+                        worksheet.id,
+                        row_number - 1,
+                        field_column,
+                        new_value,
+                        numeric=field in NUMERIC_COLUMNS,
+                    ),
+                    self._append_cells_request("Audit Log", audit_values),
+                ]
+            }
+        )
+        return old_value, new_value
+
+    def update_pending_payment_amount(
+        self,
+        payment_id: str,
+        new_amount: str,
+        actor_id: int,
+        reason: str,
+    ) -> tuple[str, str]:
+        worksheet = self._worksheet("Payments")
+        values = worksheet.get_all_values()
+        headers = values[0] if values else []
+        if "Payment ID" not in headers or "Submitted for Payout" not in headers:
+            raise RuntimeError("Payments worksheet is missing required headers")
+        id_column = headers.index("Payment ID")
+        status_column = headers.index("Submitted for Payout")
+        amount_column = headers.index("Actual Paid Amount")
+        target = None
+        for row_number, row in enumerate(values[1:], start=2):
+            padded = row + [""] * max(0, len(headers) - len(row))
+            if str(padded[id_column]).strip() == payment_id.strip():
+                target = (row_number, padded)
+                break
+        if target is None:
+            raise KeyError(f"Payment {payment_id} was not found")
+        row_number, row = target
+        if str(row[status_column]).strip().lower() in {"yes", "да", "true", "1"}:
+            raise ValueError("Payment already has a payout batch and cannot be edited")
+        old_value = str(row[amount_column])
+        if old_value == new_amount:
+            raise ValueError("The new amount is unchanged")
+        audit_values = self._audit_values(
+            actor_id,
+            "CORRECT",
+            "Payment",
+            payment_id,
+            "Actual Paid Amount",
+            old_value,
+            new_amount,
+            reason,
+        )
+        self._require_workbook().batch_update(
+            {
+                "requests": [
+                    self._update_cell_request(
+                        worksheet.id,
+                        row_number - 1,
+                        amount_column,
+                        new_amount,
+                        numeric=True,
+                    ),
+                    self._append_cells_request("Audit Log", audit_values),
+                ]
+            }
+        )
+        return old_value, new_amount
 
     def upsert_timesheet(self, work_date: date, status: str) -> None:
         self._upsert_record(
@@ -341,4 +703,16 @@ class GoogleSheetsAPI:
             "payments": self._records("Payments"),
             "timesheet": self._records("Timesheet"),
             "kpi": self._records("KPI"),
+        }
+
+    def get_payout_batches(self) -> list[dict[str, str]]:
+        return self._records("Payout Batches")
+
+    def get_backup_data(self) -> dict[str, Any]:
+        return {
+            "exported_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "sheets": {
+                title: self._records(title)
+                for title in SHEET_HEADERS
+            },
         }

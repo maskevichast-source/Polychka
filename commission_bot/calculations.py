@@ -52,6 +52,8 @@ class DashboardTotals:
     plan_completion_percent: Decimal
     expected_bonus: Decimal
     submitted_bonus: Decimal
+    pending_bonus: Decimal
+    payment_bonus_by_id: Mapping[str, Decimal]
     kpi_bonus: Decimal
     total_expected_income: Decimal
 
@@ -239,22 +241,29 @@ def calculate_fixed_salary(worked_days: Any, standard_working_days: Any) -> Deci
 
 def calculate_sick_pay(
     sick_days: Any,
-    standard_working_days: Any,
+    average_daily_pay: Any,
     one_mrp_value: Any,
 ) -> Decimal:
     sick = to_decimal(sick_days, "sick_days")
-    standard = to_decimal(standard_working_days, "standard_working_days")
+    daily_average = to_decimal(average_daily_pay, "average_daily_pay")
     mrp = to_decimal(one_mrp_value, "one_mrp_value")
-    if sick < ZERO or standard <= ZERO or mrp <= ZERO:
-        raise CalculationError("Sick days, working days and MRP must be valid positive values")
-    daily_average = FIXED_MONTHLY_SALARY / standard
+    if sick < ZERO or mrp <= ZERO:
+        raise CalculationError("Sick days, average daily pay and MRP must be valid")
+    if sick == ZERO:
+        return ZERO
+    if daily_average <= ZERO:
+        raise CalculationError("average_daily_pay must be greater than zero")
     return quantize_money(min(daily_average * sick, SICK_LEAVE_MRP_CAP * mrp))
 
 
-def calculate_kpi_bonus(criteria: Mapping[str, Any]) -> Decimal:
+def calculate_kpi_bonus(
+    criteria: Mapping[str, Any],
+    plan_completion_percent: Any,
+) -> Decimal:
+    """Calculate KPI pay; plan qualification always comes from actual sales."""
+    plan_completion = to_decimal(plan_completion_percent, "plan_completion_percent")
     values = (
         ("Criteria 1 (CRM)", Decimal("30000")),
-        ("Criteria 2 (Plan >90%)", Decimal("40000")),
         ("Criteria 3 (Marketing)", Decimal("30000")),
     )
     total = ZERO
@@ -262,6 +271,8 @@ def calculate_kpi_bonus(criteria: Mapping[str, Any]) -> Decimal:
         value = str(criteria.get(key, "")).strip().lower()
         if value in {"yes", "да", "true", "1", "on"}:
             total += amount
+    if plan_completion >= Decimal("90"):
+        total += Decimal("40000")
     return total
 
 
@@ -301,8 +312,14 @@ def calculate_dashboard_totals(
     planned_days = int(to_decimal(current_settings.get("Standard working days"), "standard working days"))
     monthly_plan = to_decimal(current_settings.get("Monthly Sales Plan"), "monthly sales plan")
     mrp_value = to_decimal(current_settings.get("1 MRP value (in KZT)"), "MRP value")
+    average_daily_pay = to_decimal(
+        current_settings.get("Average daily pay (in KZT)"),
+        "average daily pay",
+    )
     if planned_days <= 0 or monthly_plan <= ZERO or mrp_value <= ZERO:
-        raise CalculationError("Monthly settings must contain positive workdays, plan and MRP")
+        raise CalculationError(
+            "Monthly settings must contain positive workdays, plan and MRP"
+        )
 
     deals = list(deal_records)
     deals_by_id: dict[str, Mapping[str, Any]] = {}
@@ -352,16 +369,18 @@ def calculate_dashboard_totals(
             sick_days += 1
 
     fixed_salary = calculate_fixed_salary(worked_days, planned_days)
-    sick_pay = calculate_sick_pay(sick_days, planned_days, mrp_value)
+    sick_pay = calculate_sick_pay(sick_days, average_daily_pay, mrp_value)
     current_kpi: Mapping[str, Any] = {}
     for row in kpi_records:
         if normalize_month(row.get("Month")) == month_key:
             current_kpi = row
             break
-    kpi_bonus = calculate_kpi_bonus(current_kpi)
+    kpi_bonus = calculate_kpi_bonus(current_kpi, plan_completion)
 
     expected_bonus = ZERO
     submitted_bonus = ZERO
+    pending_bonus = ZERO
+    payment_bonus_by_id: dict[str, Decimal] = {}
     paid_before_by_deal: dict[str, Decimal] = {}
     ordered_payments: list[tuple[date, Mapping[str, Any]]] = []
     for payment in payment_records:
@@ -417,8 +436,18 @@ def calculate_dashboard_totals(
                 item_type=deal.get("Item Type"),
             )
             expected_bonus += total
+            payment_id = str(payment.get("Payment ID", "")).strip()
+            if payment_id:
+                payment_bonus_by_id[payment_id] = total
             if _yes(payment.get("Submitted for Payout")):
-                submitted_bonus += total
+                submitted_snapshot = str(payment.get("Payout Bonus Amount", "")).strip()
+                submitted_bonus += (
+                    to_decimal(submitted_snapshot, "payout bonus amount")
+                    if submitted_snapshot
+                    else total
+                )
+            else:
+                pending_bonus += total
         paid_before_by_deal[deal_id] = paid_before_by_deal.get(deal_id, ZERO) + paid
 
     total_expected = fixed_salary + sick_pay + expected_bonus + kpi_bonus
@@ -434,6 +463,8 @@ def calculate_dashboard_totals(
         plan_completion_percent=plan_completion,
         expected_bonus=quantize_money(expected_bonus),
         submitted_bonus=quantize_money(submitted_bonus),
+        pending_bonus=quantize_money(pending_bonus),
+        payment_bonus_by_id=payment_bonus_by_id,
         kpi_bonus=quantize_money(kpi_bonus),
         total_expected_income=quantize_money(total_expected),
     )
