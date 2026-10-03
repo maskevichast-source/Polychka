@@ -1,0 +1,1 @@
+- [Python in pnpm workspaces](python-in-pnpm-workspaces.md) — package installs may initialize uv scaffolding at repo root; check and clean generated files when Python belongs in a subdirectory.
