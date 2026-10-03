@@ -1,0 +1,55 @@
+Act as a Senior Python Developer. Your task is to build a Telegram bot using Python (aiogram 3.x) for tracking sales commissions, KPIs, and payroll for a luxury furniture sales manager (Eichholtz). The bot must be ready for deployment on Railway (include requirements.txt, a Procfile, and instructions for .env).
+
+CRITICAL UI REQUIREMENT: 
+All internal code, variable names, and comments should be in English, but ALL user-facing text, bot replies, inline keyboard buttons, and menus MUST be strictly in Russian.
+
+TECH STACK: 
+- Python 3.11+, aiogram 3.x, gspread (with oauth2client for Google Sheets integration), apscheduler (for cron jobs).
+
+DATABASE (Google Sheets):
+The bot uses Google Sheets as a database. If the following sheets don't exist, the bot should create them automatically:
+1. "Settings": Month, Year, Standard working days, Monthly Sales Plan, 1 MRP value (in KZT).
+2. "Deals": Deal ID, Date, Deal Total Amount, Designer %, Client Discount %, Item Type (In-stock / Order / Sale). *Note: Deal Total Amount goes towards the Monthly Plan completion.*
+3. "Payments": Payment ID, Deal ID, Actual Paid Amount (Base for bonus calculation), Date, Submitted for Payout (Yes/No).
+4. "Timesheet": Date, Status (Work / Day Off / Sick).
+5. "KPI": Month, Criteria 1 (CRM), Criteria 2 (Plan >90%), Criteria 3 (Marketing).
+
+FINANCIAL LOGIC & MATH (STRICT REQUIREMENTS):
+1. Fixed Salary: 250,000 KZT per month (calculated proportionally based on days worked vs standard working days).
+2. Sick Leave (Kazakhstan Law): Calculated as (Average daily pay * sick days), capped at a maximum of 25 MRP per month.
+3. Plan Completion %: (Sum of all Deal Total Amounts for the month / Monthly Sales Plan) * 100.
+4. Bonus Calculation Base: Actual Paid Amount minus the Designer %.
+5. Discount Coefficient (Applies to the final bonus amount):
+   - Discount <= 10%: Coef 1.0
+   - Discount 10.01% - 15%: Coef 0.9
+   - Discount > 15%: Coef 0.8
+   - Exception: If the discount is covered by the designer's bonus, Coef is always 1.0.
+6. Progressive Bonus Rates (Differentiated chunk-based calculation):
+   The bonus is calculated progressively based on the Plan Completion %. Each chunk of the sales volume is multiplied by its respective tier rate:
+   - Chunk 0-60%: 1% rate
+   - Chunk 61-70%: 1.5% rate
+   - Chunk 71-90%: 1.7% rate
+   - Chunk 91-110%: 2% (if "In-stock") OR 3% (if "Order")
+   - Chunk >111%: 2.5% (if "In-stock") OR 3.5% (if "Order")
+   - Exception: If Item Type is "Sale" (Распродажа), a fixed 3% rate applies to the entire amount, ignoring plan completion tiers.
+7. KPI (100,000 KZT total max per month):
+   - CRM criteria met: +30,000 KZT (30%)
+   - Individual plan >= 90%: +40,000 KZT (40%)
+   - Marketing participation: +30,000 KZT (30%)
+
+CORE COMMANDS & FEATURES (Use FSM for data entry):
+- APScheduler CRON: On the 2nd day of every month, the bot automatically messages the user asking to input the "Monthly Sales Plan" and "Standard working days" for the new month.
+- /add_deal: FSM to add a new deal (Amount, Designer %, Discount %, Item Type).
+- /add_payment: FSM to add a client's payment to an existing deal.
+- /tuesday_sync: Shows a list of new payments not yet submitted for bonus payout. Includes an inline button to "Mark all as submitted".
+- /kpi: Inline keyboard with toggle buttons (On/Off) for the 3 KPI criteria for the current month.
+- /dashboard: Generates a monthly summary message containing:
+  * Days worked / Planned days
+  * Accrued fixed salary + Sick pay
+  * Plan completion (in % and KZT)
+  * Earned bonuses (Expected / Submitted for payout)
+  * Earned KPI amount
+  * TOTAL expected income for the month.
+
+CODE ARCHITECTURE:
+Separate the code into logical modules: main.py, handlers.py, keyboards.py, google_sheets_api.py, calculations.py. Pay special attention to calculations.py to ensure the progressive bonus math handles edge cases flawlessly (e.g., when a single payment pushes the user across two different rate tiers).
